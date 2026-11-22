@@ -49,19 +49,9 @@ func (m *Manager) SendTextMessage(ctx context.Context, id, phoneNumber, text str
 		return SendMessageResult{}, ErrSessionNotConnected
 	}
 
-	lookup, err := client.IsOnWhatsApp(ctx, []string{"+" + phoneNumber})
+	recipient, err := resolveWhatsAppRecipient(ctx, client, phoneNumber)
 	if err != nil {
-		return SendMessageResult{}, fmt.Errorf("check WhatsApp recipient: %w", err)
-	}
-	var recipient types.JID
-	for _, result := range lookup {
-		if result.IsIn {
-			recipient = result.JID
-			break
-		}
-	}
-	if recipient.IsEmpty() {
-		return SendMessageResult{}, ErrWhatsAppNumberNotRegistered
+		return SendMessageResult{}, err
 	}
 
 	message := &waE2E.Message{Conversation: new(text)}
@@ -130,6 +120,19 @@ func (m *Manager) SendTextMessage(ctx context.Context, id, phoneNumber, text str
 		LinkPreviewGenerated: message.ExtendedTextMessage != nil,
 		LinkPreviewError:     previewError,
 	}, nil
+}
+
+func resolveWhatsAppRecipient(ctx context.Context, client *whatsmeow.Client, phoneNumber string) (types.JID, error) {
+	lookup, err := client.IsOnWhatsApp(ctx, []string{"+" + phoneNumber})
+	if err != nil {
+		return types.JID{}, fmt.Errorf("check WhatsApp recipient: %w", err)
+	}
+	for _, result := range lookup {
+		if result.IsIn {
+			return result.JID, nil
+		}
+	}
+	return types.JID{}, ErrWhatsAppNumberNotRegistered
 }
 
 func firstMessageURL(text string) string {

@@ -37,5 +37,6 @@ func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux.HandleFunc("/syncChatHistory", handlers.SyncChatHistory(waManager))
 	mux.HandleFunc("/syncUserChatHistory", handlers.SyncUserChatHistory(waManager))
 	mux.HandleFunc("/sendMessage", handlers.SendMessage(waManager))
+	mux.HandleFunc("/sendImageMessage", handlers.SendImageMessage(waManager))
 	return RequestLoggingMiddleware(mux)
 }
