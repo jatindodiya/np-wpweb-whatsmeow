@@ -29,16 +29,25 @@ func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux.HandleFunc("/sessions", handlers.GetSessions(waManager))
 	mux.HandleFunc("/session/qr", handlers.GetSessionQR(waManager))
 	mux.HandleFunc("/session/status", handlers.GetSessionStatus(waManager))
+
+	// WhatsApp contact and group endpoints
 	mux.HandleFunc("/contacts", handlers.GetContacts(waManager.GetClient))
 	mux.HandleFunc("/groups", handlers.GetGroups(waManager.GetClient))
 	mux.HandleFunc("/checkRegisteredUsers", handlers.CheckWhatsAppNumber(waManager.GetClient))
+
+	// Chat history endpoints
 	mux.HandleFunc("/userChatHistory", handlers.GetUserChatHistory(waManager))
 	mux.HandleFunc("/syncWpSession", handlers.SyncWpSession(waManager))
 	mux.HandleFunc("/syncChatHistory", handlers.SyncChatHistory(waManager))
 	mux.HandleFunc("/syncUserChatHistory", handlers.SyncUserChatHistory(waManager))
+
+	// Message sending endpoints
 	mux.HandleFunc("/sendMessage", handlers.SendMessage(waManager))
 	mux.HandleFunc("/sendImageMessage", handlers.SendImageMessage(waManager))
 	mux.HandleFunc("/sendVideoMessage", handlers.SendVideoMessage(waManager))
 	mux.HandleFunc("/sendDocumentMessage", handlers.SendDocumentMessage(waManager))
+	mux.HandleFunc("/sendPoll", handlers.SendPoll(waManager))
+	mux.HandleFunc("/sendGroupInvite", handlers.SendGroupInvite(waManager))
+	
 	return RequestLoggingMiddleware(mux)
 }

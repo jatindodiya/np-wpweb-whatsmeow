@@ -237,6 +237,10 @@ func chatMessageType(messageType string, message *waE2E.Message) string {
 		return "document"
 	case message.GetStickerMessage() != nil:
 		return "sticker"
+	case message.GetPollCreationMessage() != nil:
+		return "poll"
+	case message.GetGroupInviteMessage() != nil:
+		return "group_invite"
 	case message.GetLocationMessage() != nil:
 		return "location"
 	case message.GetContactMessage() != nil:
@@ -264,6 +268,15 @@ func chatMessageText(message *waE2E.Message) string {
 		return text
 	}
 	if text := message.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage().GetCaption(); text != "" {
+		return text
+	}
+	if text := message.GetPollCreationMessage().GetName(); text != "" {
+		return text
+	}
+	if text := message.GetGroupInviteMessage().GetCaption(); text != "" {
+		return text
+	}
+	if text := message.GetGroupInviteMessage().GetGroupName(); text != "" {
 		return text
 	}
 	return message.GetButtonsResponseMessage().GetSelectedDisplayText()
