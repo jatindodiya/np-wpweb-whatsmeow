@@ -2,6 +2,7 @@ package whatsapp
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -36,6 +37,8 @@ var (
 	ErrSessionNotPaired      = errors.New("WhatsApp session has no paired device to resume")
 	ErrSessionNumberMismatch = errors.New("WhatsApp account number does not match phoneNumber")
 	ErrSessionNotFound       = errors.New("WhatsApp session not found")
+	ErrSessionNotConnected   = errors.New("WhatsApp session is not connected")
+	ErrChatHistoryCursorNotFound = errors.New("no stored message exists for this number; request recent history first")
 	ErrQRCodeUnavailable     = errors.New("QR code is not available")
 	sessionIDPattern         = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
@@ -60,11 +63,13 @@ type SessionStatus struct {
 type Service struct {
 	Client       *whatsmeow.Client
 	container    *sqlstore.Container
+	historyDB    *sql.DB
 	ctx          context.Context
 	cancel       context.CancelFunc
 	mu           sync.RWMutex
 	closeOnce    sync.Once
 	mismatchOnce sync.Once
+	syncMu       sync.Mutex
 	rejected     atomic.Bool
 	loggedOut    atomic.Bool
 	manager      *Manager
@@ -89,6 +94,8 @@ type Manager struct {
 func NewManager(baseDSN string) *Manager {
 	waStore.SetOSInfo(linkedDeviceName, waStore.GetWAVersion())
 	waStore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+	waStore.DeviceProps.HistorySyncConfig.OnDemandReady = new(true)
+	waStore.DeviceProps.HistorySyncConfig.CompleteOnDemandReady = new(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
@@ -206,9 +213,16 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	handleEvent := eventHandler(client)
 	sessionCtx, sessionCancel := context.WithCancel(m.ctx)
+	historyDB, err := openChatHistoryStore(sqlitePath(sessionDSN) + "-history.db")
+	if err != nil {
+		sessionCancel()
+		_ = container.Close()
+		return SessionInitResult{}, err
+	}
 	service := &Service{
 		Client:       client,
 		container:    container,
+		historyDB:    historyDB,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		databasePath: sqlitePath(sessionDSN),
@@ -223,6 +237,7 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 			go service.rejectMismatchedNumber()
 		}
 	})
+	service.attachChatHistoryHandler()
 	keepSession := false
 	defer func() {
 		if !keepSession {
@@ -343,9 +358,16 @@ func (m *Manager) Start(id string) (SessionStatus, error) {
 	deviceStore := devices[0]
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	sessionCtx, sessionCancel := context.WithCancel(m.ctx)
+	historyDB, err := openChatHistoryStore(databasePath + "-history.db")
+	if err != nil {
+		sessionCancel()
+		_ = container.Close()
+		return SessionStatus{}, err
+	}
 	service := &Service{
 		Client:       client,
 		container:    container,
+		historyDB:    historyDB,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		databasePath: databasePath,
@@ -372,6 +394,7 @@ func (m *Manager) Start(id string) (SessionStatus, error) {
 			service.setSessionResult(SessionInitResult{Status: "disconnected"})
 		}
 	})
+	service.attachChatHistoryHandler()
 
 	if err := client.Connect(); err != nil {
 		sessionCancel()
@@ -554,7 +577,7 @@ func (m *Manager) deleteExpiredQRSession(service *Service) {
 
 func removeSessionDatabase(databasePath string) error {
 	var removeErrors []error
-	for _, suffix := range []string{"", "-wal", "-shm"} {
+	for _, suffix := range []string{"", "-wal", "-shm", "-history.db", "-history.db-wal", "-history.db-shm"} {
 		path := databasePath + suffix
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
@@ -875,6 +898,11 @@ func (s *Service) Close() {
 		}
 		if s.Client != nil {
 			s.Client.Disconnect()
+		}
+		if s.historyDB != nil {
+			if err := s.historyDB.Close(); err != nil {
+				fmt.Println("Failed to close WhatsApp chat history store:", err)
+			}
 		}
 		if s.container != nil {
 			if err := s.container.Close(); err != nil {

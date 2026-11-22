@@ -32,5 +32,9 @@ func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux.HandleFunc("/contacts", handlers.GetContacts(waManager.GetClient))
 	mux.HandleFunc("/groups", handlers.GetGroups(waManager.GetClient))
 	mux.HandleFunc("/checkRegisteredUsers", handlers.CheckWhatsAppNumber(waManager.GetClient))
+	mux.HandleFunc("/userChatHistory", handlers.GetUserChatHistory(waManager))
+	mux.HandleFunc("/syncWpSession", handlers.SyncWpSession(waManager))
+	mux.HandleFunc("/syncChatHistory", handlers.SyncChatHistory(waManager))
+	mux.HandleFunc("/syncUserChatHistory", handlers.SyncUserChatHistory(waManager))
 	return RequestLoggingMiddleware(mux)
 }
