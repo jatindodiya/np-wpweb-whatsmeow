@@ -221,6 +221,7 @@ func chatMessageType(messageType string, message *waE2E.Message) string {
 	if messageType != "" {
 		return messageType
 	}
+	message = unwrapMessage(message)
 	switch {
 	case message.GetConversation() != "":
 		return "text"
@@ -246,6 +247,7 @@ func chatMessageType(messageType string, message *waE2E.Message) string {
 }
 
 func chatMessageText(message *waE2E.Message) string {
+	message = unwrapMessage(message)
 	if text := message.GetConversation(); text != "" {
 		return text
 	}
@@ -265,6 +267,31 @@ func chatMessageText(message *waE2E.Message) string {
 		return text
 	}
 	return message.GetButtonsResponseMessage().GetSelectedDisplayText()
+}
+
+func unwrapMessage(message *waE2E.Message) *waE2E.Message {
+	for message != nil {
+		var nested *waE2E.Message
+		switch {
+		case message.GetViewOnceMessageV2() != nil:
+			nested = message.GetViewOnceMessageV2().GetMessage()
+		case message.GetViewOnceMessageV2Extension() != nil:
+			nested = message.GetViewOnceMessageV2Extension().GetMessage()
+		case message.GetViewOnceMessage() != nil:
+			nested = message.GetViewOnceMessage().GetMessage()
+		case message.GetEphemeralMessage() != nil:
+			nested = message.GetEphemeralMessage().GetMessage()
+		case message.GetDocumentWithCaptionMessage() != nil:
+			nested = message.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return message
+		}
+		if nested == nil {
+			return nil
+		}
+		message = nested
+	}
+	return nil
 }
 
 func (m *Manager) GetChatHistory(ctx context.Context, id, phoneNumber string, limit int, before int64, beforeID string) ([]ChatMessage, bool, error) {

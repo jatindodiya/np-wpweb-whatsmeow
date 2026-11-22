@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	maxImageUploadSize = 16 << 20
+	maxImageUploadSize  = 16 << 20
 	maxImageRequestSize = maxImageUploadSize + (1 << 20)
 )
 
@@ -70,6 +70,20 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "caption must be 1024 characters or fewer"})
 			return
 		}
+		viewOnceValue, err := singleFormValue(r, "viewOnce", false)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		viewOnce := false
+		switch strings.ToLower(strings.TrimSpace(viewOnceValue)) {
+		case "", "false":
+		case "true":
+			viewOnce = true
+		default:
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "viewOnce must be true or false"})
+			return
+		}
 
 		file, _, err := r.FormFile("image")
 		if err != nil {
@@ -89,7 +103,7 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		result, err := manager.SendImageMessage(ctx, strings.ToLower(sessionID), digits, caption, data)
+		result, err := manager.SendImageMessage(ctx, strings.ToLower(sessionID), digits, caption, viewOnce, data)
 		if err != nil {
 			switch {
 			case errors.Is(err, whatsapp.ErrSessionNotFound):
@@ -113,7 +127,7 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 func validateImageFormKeys(form *multipart.Form) error {
 	for key := range form.Value {
-		if key != "mobileNumber" && key != "caption" {
+		if key != "mobileNumber" && key != "caption" && key != "viewOnce" {
 			return fmt.Errorf("unknown form field %q", key)
 		}
 	}

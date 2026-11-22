@@ -22,13 +22,14 @@ const maxImagePixels = 20_000_000
 var ErrInvalidImage = errors.New("invalid image")
 
 type SendImageMessageResult struct {
-	ID        string `json:"messageId"`
-	Recipient string `json:"recipient"`
-	Timestamp string `json:"timestamp"`
+	ID            string `json:"messageId"`
+	Recipient     string `json:"recipient"`
+	Timestamp     string `json:"timestamp"`
 	HistoryStored bool `json:"historyStored"`
+	ViewOnce      bool   `json:"viewOnce"`
 }
 
-func (m *Manager) SendImageMessage(ctx context.Context, id, phoneNumber, caption string, data []byte) (SendImageMessageResult, error) {
+func (m *Manager) SendImageMessage(ctx context.Context, id, phoneNumber, caption string, viewOnce bool, data []byte) (SendImageMessageResult, error) {
 	if !ValidSessionID(id) {
 		return SendImageMessageResult{}, errors.New("id must be a UUID")
 	}
@@ -79,10 +80,20 @@ func (m *Manager) SendImageMessage(ctx context.Context, id, phoneNumber, caption
 		JPEGThumbnail:     thumbnail,
 		MediaKeyTimestamp: proto.Int64(time.Now().Unix()),
 	}
+	if viewOnce {
+		imageMessage.ViewOnce = proto.Bool(true)
+	}
 	if caption != "" {
 		imageMessage.Caption = proto.String(caption)
 	}
 	message := &waE2E.Message{ImageMessage: imageMessage}
+	if viewOnce {
+		message = &waE2E.Message{
+			ViewOnceMessageV2: &waE2E.FutureProofMessage{
+				Message: message,
+			},
+		}
+	}
 	response, err := client.SendMessage(ctx, recipient, message)
 	if err != nil {
 		return SendImageMessageResult{}, fmt.Errorf("send WhatsApp image message: %w", err)
@@ -112,6 +123,7 @@ func (m *Manager) SendImageMessage(ctx context.Context, id, phoneNumber, caption
 		Recipient:     recipient.String(),
 		Timestamp:     response.Timestamp.UTC().Format(time.RFC3339Nano),
 		HistoryStored: historyStored,
+		ViewOnce:      viewOnce,
 	}, nil
 }
 
