@@ -2,18 +2,89 @@ package whatsapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
+const (
+	linkedDeviceName     = "NotifyPro - Perfect Innovations"
+	maxQRPairingTimeouts = 3
+)
+
+var (
+	ErrSessionAlreadyExists  = errors.New("session is already initialized or initializing")
+	ErrManagerClosed         = errors.New("WhatsApp session manager is closed")
+	ErrSessionNumberMismatch = errors.New("WhatsApp account number does not match phoneNumber")
+	ErrSessionNotFound       = errors.New("WhatsApp session not found")
+	ErrQRCodeUnavailable     = errors.New("QR code is not available")
+	sessionIDPattern         = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+)
+
+type SessionInitResult struct {
+	Status      string
+	PairingCode string
+	QRCode      string
+	Existing    bool
+}
+
 type Service struct {
-	Client *whatsmeow.Client
-	store  *sqlstore.Container
+	Client       *whatsmeow.Client
+	container    *sqlstore.Container
+	mu           sync.RWMutex
+	closeOnce    sync.Once
+	mismatchOnce sync.Once
+	rejected     atomic.Bool
+	manager      *Manager
+	id           string
+	phone        string
+	mode         string
+	result       SessionInitResult
+	databasePath string
+	qrTimeouts   int
+}
+
+type Manager struct {
+	baseDSN      string
+	ctx          context.Context
+	cancel       context.CancelFunc
+	mu           sync.RWMutex
+	sessions     map[string]*Service
+	initializing map[string]struct{}
+	closed       bool
+}
+
+func NewManager(baseDSN string) *Manager {
+	waStore.SetOSInfo(linkedDeviceName, waStore.GetWAVersion())
+	waStore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{
+		baseDSN:      baseDSN,
+		ctx:          ctx,
+		cancel:       cancel,
+		sessions:     make(map[string]*Service),
+		initializing: make(map[string]struct{}),
+	}
+}
+
+func ValidSessionID(id string) bool {
+	return sessionIDPattern.MatchString(id)
 }
 
 func eventHandler(client *whatsmeow.Client) func(evt any) {
@@ -24,7 +95,7 @@ func eventHandler(client *whatsmeow.Client) func(evt any) {
 		case *events.Disconnected:
 			fmt.Println("Disconnected from WhatsApp.")
 		case *events.LoggedOut:
-			fmt.Println("Logged out from WhatsApp. Delete whatsmeow.db to re-pair.")
+			fmt.Println("Logged out from WhatsApp.")
 		case *events.Message:
 			if v.Message == nil {
 				return
@@ -40,49 +111,428 @@ func eventHandler(client *whatsmeow.Client) func(evt any) {
 	}
 }
 
-func NewService(ctx context.Context, dbDSN, phoneNumber string) (*Service, error) {
-	dbLog := waLog.Stdout("Database", "WARN", true)
-	clientLog := waLog.Stdout("Client", "INFO", true)
-
-	container, err := sqlstore.New(ctx, "sqlite3", dbDSN, dbLog)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create store: %w", err)
+func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) (SessionInitResult, error) {
+	if !ValidSessionID(id) {
+		return SessionInitResult{}, errors.New("id must be a UUID")
+	}
+	id = strings.ToLower(id)
+	if len(phoneNumber) < 10 || len(phoneNumber) > 15 {
+		return SessionInitResult{}, errors.New("phoneNumber must contain 10 to 15 digits")
+	}
+	for _, digit := range phoneNumber {
+		if digit < '0' || digit > '9' {
+			return SessionInitResult{}, errors.New("phoneNumber must contain 10 to 15 digits")
+		}
+	}
+	if mode != "code" && mode != "qr" {
+		return SessionInitResult{}, errors.New("mode must be code or qr")
 	}
 
-	deviceStore, err := container.GetFirstDevice(ctx)
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return SessionInitResult{}, ErrManagerClosed
+	}
+	if service, exists := m.sessions[id]; exists {
+		m.mu.Unlock()
+		if service.phone == phoneNumber && service.mode == mode {
+			result := service.sessionResult()
+			result.Existing = true
+			return result, nil
+		}
+		return SessionInitResult{}, ErrSessionAlreadyExists
+	}
+	if _, exists := m.initializing[id]; exists {
+		m.mu.Unlock()
+		return SessionInitResult{}, ErrSessionAlreadyExists
+	}
+	m.initializing[id] = struct{}{}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.initializing, id)
+		m.mu.Unlock()
+	}()
+
+	sessionDSN, err := makeSessionDSN(m.baseDSN, id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get device: %w", err)
+		return SessionInitResult{}, err
+	}
+
+	dbLog := waLog.Stdout("Database", "WARN", true)
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	container, err := sqlstore.New(m.ctx, "sqlite3", sessionDSN, dbLog)
+	if err != nil {
+		return SessionInitResult{}, fmt.Errorf("failed to create session store: %w", err)
+	}
+
+	deviceStore, err := container.GetFirstDevice(m.ctx)
+	if err != nil {
+		_ = container.Close()
+		return SessionInitResult{}, fmt.Errorf("failed to get session device: %w", err)
+	}
+	if deviceStore.ID != nil && phoneNumberFromJID(*deviceStore.ID) != phoneNumber {
+		fmt.Printf("WhatsApp session %s number mismatch; clearing local session before connecting\n", id)
+		if err = deviceStore.Delete(m.ctx); err != nil {
+			_ = container.Close()
+			return SessionInitResult{}, fmt.Errorf("failed to clear mismatched WhatsApp device: %w", err)
+		}
+		if err = container.Close(); err != nil {
+			return SessionInitResult{}, fmt.Errorf("failed to close mismatched WhatsApp session store: %w", err)
+		}
+		if err = removeSessionDatabase(sqlitePath(sessionDSN)); err != nil {
+			return SessionInitResult{}, fmt.Errorf("failed to delete mismatched WhatsApp session database: %w", err)
+		}
+		return SessionInitResult{}, ErrSessionNumberMismatch
 	}
 
 	client := whatsmeow.NewClient(deviceStore, clientLog)
-	client.AddEventHandler(eventHandler(client))
-
-	if err := client.Connect(); err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
+	handleEvent := eventHandler(client)
+	service := &Service{
+		Client:       client,
+		container:    container,
+		databasePath: sqlitePath(sessionDSN),
+		manager:      m,
+		id:           id,
+		phone:        phoneNumber,
+		mode:         mode,
 	}
-
-	if client.Store.ID == nil {
-		code, err := client.PairPhone(ctx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-		if err != nil {
-			client.Disconnect()
-			return nil, fmt.Errorf("failed to request pairing code: %w", err)
+	client.AddEventHandler(func(evt any) {
+		handleEvent(evt)
+		if pairSuccess, ok := evt.(*events.PairSuccess); ok && phoneNumberFromJID(pairSuccess.ID) != phoneNumber {
+			go service.rejectMismatchedNumber()
 		}
+	})
+	keepSession := false
+	defer func() {
+		if !keepSession {
+			service.Close()
+		}
+	}()
 
-		fmt.Printf("WhatsApp Pairing Code for +%s: %s\n", phoneNumber, code)
-		fmt.Println("On your phone: WhatsApp -> Linked Devices -> Link a Device -> Link with phone number instead")
+	var qrChannel <-chan whatsmeow.QRChannelItem
+	if deviceStore.ID == nil {
+		qrChannel, err = client.GetQRChannel(m.ctx)
+		if err != nil {
+			return SessionInitResult{}, fmt.Errorf("failed to prepare pairing: %w", err)
+		}
 	}
 
-	return &Service{
-		Client: client,
-		store:  container,
-	}, nil
+	if err = client.Connect(); err != nil {
+		return SessionInitResult{}, fmt.Errorf("failed to connect WhatsApp client: %w", err)
+	}
+
+	result := SessionInitResult{Status: "connected"}
+	if deviceStore.ID == nil {
+		pairCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		qrCode, waitErr := waitForQR(pairCtx, qrChannel)
+		if waitErr != nil {
+			return SessionInitResult{}, waitErr
+		}
+		result.Status = "awaiting_pairing"
+		if mode == "qr" {
+			result.QRCode = qrCode
+		}
+		service.setSessionResult(result)
+		go m.drainQRChannel(qrChannel, service)
+		if mode == "code" {
+			pairingCode, pairErr := client.PairPhone(pairCtx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if pairErr != nil {
+				return SessionInitResult{}, fmt.Errorf("failed to request pairing code: %w", pairErr)
+			}
+			service.setPairingCode(pairingCode)
+		}
+	} else {
+		service.setSessionResult(result)
+	}
+
+	result = service.sessionResult()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return SessionInitResult{}, ErrManagerClosed
+	}
+	if service.rejected.Load() {
+		m.mu.Unlock()
+		return SessionInitResult{}, ErrSessionNumberMismatch
+	}
+	m.sessions[id] = service
+	m.mu.Unlock()
+	keepSession = true
+	return result, nil
+}
+
+func makeSessionDSN(baseDSN, id string) (string, error) {
+	if !strings.HasPrefix(baseDSN, "file:") {
+		return "", errors.New("DB_DSN must be a persistent SQLite file DSN beginning with file:")
+	}
+
+	pathAndQuery := strings.TrimPrefix(baseDSN, "file:")
+	dbPath, query, hasQuery := strings.Cut(pathAndQuery, "?")
+	if dbPath == "" || dbPath == ":memory:" {
+		return "", errors.New("DB_DSN must point to a persistent SQLite file")
+	}
+
+	extension := filepath.Ext(dbPath)
+	sessionPath := strings.TrimSuffix(dbPath, extension) + "-" + id + extension
+	if dir := filepath.Dir(sessionPath); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return "", fmt.Errorf("failed to create session database directory: %w", err)
+		}
+	}
+
+	sessionDSN := "file:" + sessionPath
+	if hasQuery {
+		sessionDSN += "?" + query
+	}
+	return sessionDSN, nil
+}
+
+func sqlitePath(sessionDSN string) string {
+	pathAndQuery := strings.TrimPrefix(sessionDSN, "file:")
+	dbPath, _, _ := strings.Cut(pathAndQuery, "?")
+	return dbPath
+}
+
+func waitForQR(ctx context.Context, qrChannel <-chan whatsmeow.QRChannelItem) (string, error) {
+	select {
+	case item, ok := <-qrChannel:
+		if !ok {
+			return "", errors.New("WhatsApp closed the QR channel before sending a code")
+		}
+		if item.Event == whatsmeow.QRChannelEventCode {
+			return item.Code, nil
+		}
+		if item.Error != nil {
+			return "", fmt.Errorf("WhatsApp pairing failed: %w", item.Error)
+		}
+		return "", fmt.Errorf("unexpected WhatsApp pairing event: %s", item.Event)
+	case <-ctx.Done():
+		return "", fmt.Errorf("timed out waiting for WhatsApp pairing code: %w", ctx.Err())
+	}
+}
+
+func (m *Manager) drainQRChannel(qrChannel <-chan whatsmeow.QRChannelItem, service *Service) {
+	timedOut := false
+	for item := range qrChannel {
+		service.mu.Lock()
+		switch item.Event {
+		case whatsmeow.QRChannelEventCode:
+			if service.mode == "qr" {
+				service.result.QRCode = item.Code
+			}
+		case whatsmeow.QRChannelSuccess.Event:
+			service.result.Status = "connected"
+			service.result.PairingCode = ""
+			service.result.QRCode = ""
+		case whatsmeow.QRChannelTimeout.Event:
+			service.qrTimeouts++
+			service.result.Status = "refreshing_qr"
+			service.result.PairingCode = ""
+			service.result.QRCode = ""
+			timedOut = true
+		case whatsmeow.QRChannelEventError:
+			service.result.Status = "pairing_failed"
+			service.result.PairingCode = ""
+			service.result.QRCode = ""
+		}
+		service.mu.Unlock()
+	}
+	if !timedOut {
+		return
+	}
+
+	service.mu.RLock()
+	timeoutCount := service.qrTimeouts
+	service.mu.RUnlock()
+	if timeoutCount >= maxQRPairingTimeouts {
+		service.setSessionResult(SessionInitResult{Status: "pairing_timeout"})
+		fmt.Printf("WhatsApp session %s reached %d QR pairing timeouts; deleting session\n", service.id, timeoutCount)
+		m.deleteExpiredQRSession(service)
+		return
+	}
+
+	if err := m.startNextPairingAttempt(service); err != nil {
+		service.setSessionResult(SessionInitResult{Status: "pairing_failed"})
+		fmt.Printf("WhatsApp session %s failed to refresh QR code: %v\n", service.id, err)
+		return
+	}
+}
+
+func (m *Manager) startNextPairingAttempt(service *Service) error {
+	if m.ctx.Err() != nil {
+		return m.ctx.Err()
+	}
+	service.Client.Disconnect()
+	qrChannel, err := service.Client.GetQRChannel(m.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to prepare QR pairing: %w", err)
+	}
+	if err = service.Client.Connect(); err != nil {
+		return fmt.Errorf("failed to reconnect WhatsApp client: %w", err)
+	}
+
+	qrCtx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+	qrCode, err := waitForQR(qrCtx, qrChannel)
+	if err != nil {
+		return err
+	}
+	result := SessionInitResult{Status: "awaiting_pairing"}
+	if service.mode == "qr" {
+		result.QRCode = qrCode
+	}
+	service.setSessionResult(result)
+	go m.drainQRChannel(qrChannel, service)
+	if service.mode == "code" {
+		pairingCode, pairErr := service.Client.PairPhone(m.ctx, service.phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if pairErr != nil {
+			return fmt.Errorf("failed to request refreshed pairing code: %w", pairErr)
+		}
+		service.setPairingCode(pairingCode)
+	}
+	return nil
+}
+
+func (m *Manager) deleteExpiredQRSession(service *Service) {
+	service.rejected.Store(true)
+	service.Close()
+
+	if err := removeSessionDatabase(service.databasePath); err != nil {
+		fmt.Printf("WhatsApp session %s failed to delete database files: %v\n", service.id, err)
+	}
+	m.removeSession(service.id, service)
+}
+
+func removeSessionDatabase(databasePath string) error {
+	var removeErrors []error
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := databasePath + suffix
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErrors = append(removeErrors, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+	return errors.Join(removeErrors...)
+}
+
+func (s *Service) setSessionResult(result SessionInitResult) {
+	s.mu.Lock()
+	s.result = result
+	s.mu.Unlock()
+}
+
+func (s *Service) setPairingCode(code string) {
+	s.mu.Lock()
+	if s.result.Status == "awaiting_pairing" {
+		s.result.PairingCode = code
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) sessionResult() SessionInitResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.result
+}
+
+func (s *Service) rejectMismatchedNumber() {
+	s.mismatchOnce.Do(func() {
+		s.rejected.Store(true)
+		fmt.Printf("WhatsApp session %s number mismatch; disconnecting and clearing local session\n", s.id)
+		s.setSessionResult(SessionInitResult{Status: "number_mismatch"})
+		go s.clearMismatchedSession()
+	})
+}
+
+func phoneNumberFromJID(jid types.JID) string {
+	return strings.SplitN(jid.User, ":", 2)[0]
+}
+
+func (s *Service) clearMismatchedSession() {
+	s.manager.removeSession(s.id, s)
+
+	s.Client.Disconnect()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if s.Client.Store != nil && s.Client.Store.ID != nil {
+		if err := s.Client.Store.Delete(cleanupCtx); err != nil {
+			fmt.Printf("WhatsApp session %s failed to clear mismatched device data: %v\n", s.id, err)
+		}
+	}
+	cancel()
+	s.Close()
+	if err := removeSessionDatabase(s.databasePath); err != nil {
+		fmt.Printf("WhatsApp session %s failed to delete mismatched session database files: %v\n", s.id, err)
+	}
+}
+
+func (m *Manager) removeSession(id string, expected *Service) {
+	m.mu.Lock()
+	if m.sessions[id] == expected {
+		delete(m.sessions, id)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) GetClient(id string) (*whatsmeow.Client, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	service, exists := m.sessions[strings.ToLower(id)]
+	if !exists || service.rejected.Load() {
+		return nil, false
+	}
+	return service.Client, true
+}
+
+func (m *Manager) GetQRCode(id string) (string, error) {
+	m.mu.RLock()
+	service, exists := m.sessions[strings.ToLower(id)]
+	m.mu.RUnlock()
+	if !exists || service.rejected.Load() {
+		return "", ErrSessionNotFound
+	}
+
+	service.mu.RLock()
+	defer service.mu.RUnlock()
+	if service.mode != "qr" || service.result.Status != "awaiting_pairing" || service.result.QRCode == "" {
+		return "", ErrQRCodeUnavailable
+	}
+	return service.result.QRCode, nil
+}
+
+func (m *Manager) Close() {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	m.cancel()
+	sessions := make([]*Service, 0, len(m.sessions))
+	for _, service := range m.sessions {
+		sessions = append(sessions, service)
+	}
+	m.sessions = make(map[string]*Service)
+	m.mu.Unlock()
+
+	for _, service := range sessions {
+		service.Close()
+	}
 }
 
 func (s *Service) Close() {
 	if s == nil {
 		return
 	}
-	if s.Client != nil {
-		s.Client.Disconnect()
-	}
+	s.closeOnce.Do(func() {
+		if s.Client != nil {
+			s.Client.Disconnect()
+		}
+		if s.container != nil {
+			if err := s.container.Close(); err != nil {
+				fmt.Println("Failed to close WhatsApp session store:", err)
+			}
+		}
+	})
 }

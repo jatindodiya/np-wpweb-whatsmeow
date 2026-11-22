@@ -1,2 +1,4 @@
 .env
 whatsmeow.db
+whatsmeow-*.db*
+__debug_bin*

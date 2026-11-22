@@ -23,11 +23,28 @@ type contactsResponse struct {
 	Contacts []contactItem `json:"contacts"`
 }
 
-func GetContacts(client *whatsmeow.Client) http.HandlerFunc {
+type clientLookup func(string) (*whatsmeow.Client, bool)
+
+func GetContacts(getClient clientLookup) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{
 				"error": "only GET is allowed",
+			})
+			return
+		}
+
+		sessionID := r.URL.Query().Get("id")
+		if sessionID == "" {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "id query parameter is required",
+			})
+			return
+		}
+		client, exists := getClient(sessionID)
+		if !exists {
+			WriteJSON(w, http.StatusNotFound, map[string]string{
+				"error": "WhatsApp session not found",
 			})
 			return
 		}

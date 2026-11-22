@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"go.mau.fi/whatsmeow"
 	"np-npweb-whatsmeow/internal/handlers"
+	"np-npweb-whatsmeow/internal/whatsapp"
 )
 
 func RequestLoggingMiddleware(next http.Handler) http.Handler {
@@ -19,9 +19,12 @@ func RequestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func NewRouter(waClient *whatsmeow.Client) http.Handler {
+func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/contacts", handlers.GetContacts(waClient))
-	mux.HandleFunc("/groups", handlers.GetGroups(waClient))
+	mux.HandleFunc("/health", handlers.GetHealth)
+	mux.HandleFunc("/initWpSession", handlers.InitWpSession(waManager))
+	mux.HandleFunc("/session/qr", handlers.GetSessionQR(waManager))
+	mux.HandleFunc("/contacts", handlers.GetContacts(waManager.GetClient))
+	mux.HandleFunc("/groups", handlers.GetGroups(waManager.GetClient))
 	return RequestLoggingMiddleware(mux)
 }

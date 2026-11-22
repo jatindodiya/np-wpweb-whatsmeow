@@ -13,28 +13,20 @@ import (
 	"np-npweb-whatsmeow/internal/config"
 	"np-npweb-whatsmeow/internal/routes"
 	"np-npweb-whatsmeow/internal/whatsapp"
-
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	cfg, err := config.Load(".env")
 	if err != nil {
 		fmt.Println("Configuration error:", err)
 		return
 	}
 
-	waService, err := whatsapp.NewService(ctx, cfg.DBDSN, cfg.MobileNumber)
-	if err != nil {
-		fmt.Println("WhatsApp startup error:", err)
-		return
-	}
+	waManager := whatsapp.NewManager(cfg.DBDSN)
 
 	srv := &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: routes.NewRouter(waService.Client),
+		Handler: routes.NewRouter(waManager),
 	}
 
 	go func() {
@@ -52,6 +44,5 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = srv.Shutdown(shutdownCtx)
-	cancel()
-	waService.Close()
+	waManager.Close()
 }

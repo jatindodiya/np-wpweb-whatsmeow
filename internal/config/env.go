@@ -8,9 +8,8 @@ import (
 )
 
 type Config struct {
-	MobileNumber string
-	DBDSN        string
-	ServerAddr   string
+	DBDSN      string
+	ServerAddr string
 }
 
 func LoadEnvFile(path string) error {
@@ -48,12 +47,6 @@ func Load(envPath string) (Config, error) {
 		return Config{}, fmt.Errorf("failed to load %s: %w", envPath, err)
 	}
 
-	rawPhone := os.Getenv("MOBILE_NUMBER")
-	phoneNumber := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(rawPhone), "+", ""), " ", "")
-	if phoneNumber == "" {
-		return Config{}, fmt.Errorf("MOBILE_NUMBER is not set in %s", envPath)
-	}
-
 	addr := strings.TrimSpace(os.Getenv("SERVER_ADDR"))
 	if addr == "" {
 		addr = ":4010"
@@ -65,8 +58,7 @@ func Load(envPath string) (Config, error) {
 	}
 
 	return Config{
-		MobileNumber: phoneNumber,
-		DBDSN:        dbDSN,
-		ServerAddr:   addr,
+		DBDSN:      dbDSN,
+		ServerAddr: addr,
 	}, nil
 }

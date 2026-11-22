@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-
-	"go.mau.fi/whatsmeow"
 )
 
 type groupItem struct {
@@ -19,7 +17,7 @@ type groupsResponse struct {
 	Groups []groupItem `json:"groups"`
 }
 
-func GetGroups(client *whatsmeow.Client) http.HandlerFunc {
+func GetGroups(getClient clientLookup) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			WriteJSON(w, http.StatusMethodNotAllowed, map[string]string{
@@ -28,9 +26,17 @@ func GetGroups(client *whatsmeow.Client) http.HandlerFunc {
 			return
 		}
 
-		if client == nil {
-			WriteJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "whatsapp client not initialized",
+		sessionID := r.URL.Query().Get("id")
+		if sessionID == "" {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "id query parameter is required",
+			})
+			return
+		}
+		client, exists := getClient(sessionID)
+		if !exists || client == nil {
+			WriteJSON(w, http.StatusNotFound, map[string]string{
+				"error": "WhatsApp session not found",
 			})
 			return
 		}
