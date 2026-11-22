@@ -29,8 +29,10 @@ const (
 
 var (
 	ErrSessionAlreadyExists  = errors.New("session is already initialized or initializing")
+	ErrSessionAlreadyRunning = errors.New("WhatsApp session is already running")
 	ErrManagerClosed         = errors.New("WhatsApp session manager is closed")
 	ErrSessionInitializing   = errors.New("WhatsApp session is still initializing")
+	ErrSessionNotPaired      = errors.New("WhatsApp session has no paired device to resume")
 	ErrSessionNumberMismatch = errors.New("WhatsApp account number does not match phoneNumber")
 	ErrSessionNotFound       = errors.New("WhatsApp session not found")
 	ErrQRCodeUnavailable     = errors.New("QR code is not available")
@@ -50,6 +52,8 @@ type SessionStatus struct {
 	Connected          bool   `json:"connected"`
 	WebsocketConnected bool   `json:"websocketConnected"`
 	Authenticated      bool   `json:"authenticated"`
+	SessionExists      bool   `json:"sessionExists"`
+	SessionLoaded      bool   `json:"sessionLoaded"`
 }
 
 type Service struct {
@@ -61,6 +65,7 @@ type Service struct {
 	closeOnce    sync.Once
 	mismatchOnce sync.Once
 	rejected     atomic.Bool
+	loggedOut    atomic.Bool
 	manager      *Manager
 	id           string
 	phone        string
@@ -279,19 +284,125 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 	return result, nil
 }
 
+func (m *Manager) Start(id string) (SessionStatus, error) {
+	if !ValidSessionID(id) {
+		return SessionStatus{}, errors.New("id must be a UUID")
+	}
+	id = strings.ToLower(id)
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return SessionStatus{}, ErrManagerClosed
+	}
+	if _, exists := m.sessions[id]; exists {
+		m.mu.Unlock()
+		return SessionStatus{}, ErrSessionAlreadyRunning
+	}
+	if _, exists := m.initializing[id]; exists {
+		m.mu.Unlock()
+		return SessionStatus{}, ErrSessionInitializing
+	}
+	m.initializing[id] = struct{}{}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.initializing, id)
+		m.mu.Unlock()
+	}()
+
+	sessionDSN, err := makeSessionDSN(m.baseDSN, id)
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	databasePath := sqlitePath(sessionDSN)
+	if _, err := os.Stat(databasePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return SessionStatus{}, ErrSessionNotFound
+		}
+		return SessionStatus{}, fmt.Errorf("failed to check persisted WhatsApp session: %w", err)
+	}
+
+	dbLog := waLog.Stdout("Database", "WARN", true)
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	container, err := sqlstore.New(m.ctx, "sqlite3", sessionDSN, dbLog)
+	if err != nil {
+		return SessionStatus{}, fmt.Errorf("failed to open session store: %w", err)
+	}
+	devices, err := container.GetAllDevices(m.ctx)
+	if err != nil {
+		_ = container.Close()
+		return SessionStatus{}, fmt.Errorf("failed to read stored WhatsApp devices: %w", err)
+	}
+	if len(devices) == 0 || devices[0].ID == nil {
+		_ = container.Close()
+		return SessionStatus{}, ErrSessionNotPaired
+	}
+
+	deviceStore := devices[0]
+	client := whatsmeow.NewClient(deviceStore, clientLog)
+	sessionCtx, sessionCancel := context.WithCancel(m.ctx)
+	service := &Service{
+		Client:       client,
+		container:    container,
+		ctx:          sessionCtx,
+		cancel:       sessionCancel,
+		databasePath: databasePath,
+		manager:      m,
+		id:           id,
+		phone:        phoneNumberFromJID(*deviceStore.ID),
+		mode:         "resume",
+		result:       SessionInitResult{Status: "connecting"},
+	}
+	handleEvent := eventHandler(client)
+	client.AddEventHandler(func(evt any) {
+		handleEvent(evt)
+		switch evt.(type) {
+		case *events.Connected:
+			service.setSessionResult(SessionInitResult{Status: "connected"})
+		case *events.Disconnected:
+			service.mu.Lock()
+			if service.result.Status == "connected" || service.result.Status == "connecting" {
+				service.result.Status = "disconnected"
+			}
+			service.mu.Unlock()
+		case *events.LoggedOut:
+			service.loggedOut.Store(true)
+			service.setSessionResult(SessionInitResult{Status: "disconnected"})
+		}
+	})
+
+	if err := client.Connect(); err != nil {
+		sessionCancel()
+		service.Close()
+		return SessionStatus{}, fmt.Errorf("failed to reconnect WhatsApp client: %w", err)
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		sessionCancel()
+		service.Close()
+		return SessionStatus{}, ErrManagerClosed
+	}
+	m.sessions[id] = service
+	m.mu.Unlock()
+
+	return m.GetStatus(id)
+}
+
 func makeSessionDSN(baseDSN, id string) (string, error) {
 	if !strings.HasPrefix(baseDSN, "file:") {
 		return "", errors.New("DB_DSN must be a persistent SQLite file DSN beginning with file:")
 	}
 
 	pathAndQuery := strings.TrimPrefix(baseDSN, "file:")
-	dbPath, query, hasQuery := strings.Cut(pathAndQuery, "?")
-	if dbPath == "" || dbPath == ":memory:" {
-		return "", errors.New("DB_DSN must point to a persistent SQLite file")
+	_, query, hasQuery := strings.Cut(pathAndQuery, "?")
+	sessionPath, err := sessionDatabasePath(baseDSN, id)
+	if err != nil {
+		return "", err
 	}
 
-	extension := filepath.Ext(dbPath)
-	sessionPath := strings.TrimSuffix(dbPath, extension) + "-" + id + extension
 	if dir := filepath.Dir(sessionPath); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return "", fmt.Errorf("failed to create session database directory: %w", err)
@@ -303,6 +414,22 @@ func makeSessionDSN(baseDSN, id string) (string, error) {
 		sessionDSN += "?" + query
 	}
 	return sessionDSN, nil
+}
+
+func sessionDatabasePath(baseDSN, id string) (string, error) {
+	if !strings.HasPrefix(baseDSN, "file:") {
+		return "", errors.New("DB_DSN must be a persistent SQLite file DSN beginning with file:")
+	}
+
+	pathAndQuery := strings.TrimPrefix(baseDSN, "file:")
+	dbPath, _, _ := strings.Cut(pathAndQuery, "?")
+	if dbPath == "" || dbPath == ":memory:" {
+		return "", errors.New("DB_DSN must point to a persistent SQLite file")
+	}
+
+	extension := filepath.Ext(dbPath)
+	sessionPath := strings.TrimSuffix(dbPath, extension) + "-" + id + extension
+	return sessionPath, nil
 }
 
 func sqlitePath(sessionDSN string) string {
@@ -573,11 +700,27 @@ func (m *Manager) GetStatus(id string) (SessionStatus, error) {
 	if !exists {
 		if initializing {
 			return SessionStatus{
-				ID:     id,
-				Status: "initializing",
+				ID:            id,
+				Status:        "initializing",
+				SessionExists: true,
 			}, nil
 		}
-		return SessionStatus{}, ErrSessionNotFound
+		databasePath, err := sessionDatabasePath(m.baseDSN, id)
+		if err != nil {
+			return SessionStatus{}, err
+		}
+		if _, err := os.Stat(databasePath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return SessionStatus{}, ErrSessionNotFound
+			}
+			return SessionStatus{}, fmt.Errorf("failed to check persisted WhatsApp session: %w", err)
+		}
+		return SessionStatus{
+			ID:            id,
+			Status:        "disconnected",
+			SessionExists: true,
+			SessionLoaded: false,
+		}, nil
 	}
 	if service.rejected.Load() {
 		return SessionStatus{}, ErrSessionNotFound
@@ -590,13 +733,15 @@ func (m *Manager) GetStatus(id string) (SessionStatus, error) {
 
 	status := result.Status
 	switch {
+	case service.loggedOut.Load():
+		status = "disconnected"
 	case connected:
 		status = "connected"
 	case websocketConnected && !authenticated:
 		if status == "" || status == "connected" || status == "disconnected" {
 			status = "awaiting_pairing"
 		}
-	case !websocketConnected && (status == "" || status == "connected"):
+	case !websocketConnected && (status == "" || status == "connected" || status == "connecting"):
 		status = "disconnected"
 	}
 
@@ -606,6 +751,8 @@ func (m *Manager) GetStatus(id string) (SessionStatus, error) {
 		Connected:          connected,
 		WebsocketConnected: websocketConnected,
 		Authenticated:      authenticated,
+		SessionExists:      true,
+		SessionLoaded:      true,
 	}, nil
 }
 

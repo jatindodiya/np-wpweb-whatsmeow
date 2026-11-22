@@ -23,6 +23,7 @@ func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handlers.GetHealth)
 	mux.HandleFunc("/initWpSession", handlers.InitWpSession(waManager))
+	mux.HandleFunc("/startWpSession", handlers.StartWpSession(waManager))
 	mux.HandleFunc("/terminateWpSession", handlers.TerminateWpSession(waManager))
 	mux.HandleFunc("/session/qr", handlers.GetSessionQR(waManager))
 	mux.HandleFunc("/session/status", handlers.GetSessionStatus(waManager))

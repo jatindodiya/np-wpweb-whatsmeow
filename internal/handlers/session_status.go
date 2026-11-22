@@ -16,7 +16,15 @@ func GetSessionStatus(manager *whatsapp.Manager) http.HandlerFunc {
 			return
 		}
 
-		status, err := manager.GetStatus(r.URL.Query().Get("id"))
+		sessionID := r.URL.Query().Get("id")
+		if !whatsapp.ValidSessionID(sessionID) {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "id must be a UUID",
+			})
+			return
+		}
+
+		status, err := manager.GetStatus(sessionID)
 		if err != nil {
 			if errors.Is(err, whatsapp.ErrSessionNotFound) {
 				WriteJSON(w, http.StatusNotFound, map[string]string{
@@ -24,7 +32,7 @@ func GetSessionStatus(manager *whatsapp.Manager) http.HandlerFunc {
 				})
 				return
 			}
-			WriteJSON(w, http.StatusBadRequest, map[string]string{
+			WriteJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": err.Error(),
 			})
 			return

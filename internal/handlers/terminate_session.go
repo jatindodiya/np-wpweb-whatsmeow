@@ -1,19 +1,13 @@
 package handlers
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"np-npweb-whatsmeow/internal/whatsapp"
 )
-
-type terminateSessionRequest struct {
-	ID string `json:"id"`
-}
 
 func TerminateWpSession(manager *whatsapp.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -24,32 +18,16 @@ func TerminateWpSession(manager *whatsapp.Manager) http.HandlerFunc {
 			return
 		}
 
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-
-		var request terminateSessionRequest
-		if err := decoder.Decode(&request); err != nil {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{
-				"error": fmt.Sprintf("invalid request body: %v", err),
-			})
-			return
-		}
-		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "request body must contain a single JSON object",
-			})
-			return
-		}
-		if !whatsapp.ValidSessionID(request.ID) {
+		sessionID := r.URL.Query().Get("id")
+		if !whatsapp.ValidSessionID(sessionID) {
 			WriteJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "id must be a UUID",
 			})
 			return
 		}
-		request.ID = strings.ToLower(request.ID)
+		sessionID = strings.ToLower(sessionID)
 
-		if err := manager.Terminate(r.Context(), request.ID); err != nil {
+		if err := manager.Terminate(r.Context(), sessionID); err != nil {
 			if errors.Is(err, whatsapp.ErrSessionNotFound) {
 				WriteJSON(w, http.StatusNotFound, map[string]string{
 					"error": err.Error(),
@@ -70,7 +48,7 @@ func TerminateWpSession(manager *whatsapp.Manager) http.HandlerFunc {
 		}
 
 		WriteJSON(w, http.StatusOK, map[string]string{
-			"id":     request.ID,
+			"id":     sessionID,
 			"status": "terminated",
 		})
 	}
