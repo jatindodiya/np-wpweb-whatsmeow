@@ -48,17 +48,19 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 			}
 		}
 
-		number, err := singleFormValue(r, "mobileNumber", true)
+		number, err := singleFormValue(r, "mobileNumber", false)
 		if err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		number = strings.TrimSpace(number)
-		digits := strings.TrimPrefix(number, "+")
-		if len(digits) < 10 || len(digits) > 15 || !allDigits(digits) {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "mobileNumber must contain 10 to 15 digits, optionally prefixed with +",
-			})
+		groupJID, err := singleFormValue(r, "groupJid", false)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		digits, groupJID, err := whatsapp.ValidateRecipient(number, groupJID)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		caption, err := singleFormValue(r, "caption", false)
@@ -103,7 +105,7 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		result, err := manager.SendImageMessage(ctx, strings.ToLower(sessionID), digits, caption, viewOnce, data)
+		result, err := manager.SendImageMessage(ctx, strings.ToLower(sessionID), digits, groupJID, caption, viewOnce, data)
 		if err != nil {
 			switch {
 			case errors.Is(err, whatsapp.ErrSessionNotFound):
@@ -112,6 +114,8 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 				WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			case errors.Is(err, whatsapp.ErrWhatsAppNumberNotRegistered):
 				WriteJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			case errors.Is(err, whatsapp.ErrInvalidRecipient):
+				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			case errors.Is(err, whatsapp.ErrInvalidImage):
 				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			default:
@@ -127,7 +131,7 @@ func SendImageMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 func validateImageFormKeys(form *multipart.Form) error {
 	for key := range form.Value {
-		if key != "mobileNumber" && key != "caption" && key != "viewOnce" {
+		if key != "mobileNumber" && key != "groupJid" && key != "caption" && key != "viewOnce" {
 			return fmt.Errorf("unknown form field %q", key)
 		}
 	}

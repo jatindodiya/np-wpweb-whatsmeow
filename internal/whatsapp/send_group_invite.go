@@ -24,18 +24,18 @@ type SendGroupInviteMessageResult struct {
 	HistoryStored bool   `json:"historyStored"`
 }
 
-func (m *Manager) SendGroupInviteMessage(ctx context.Context, id, phoneNumber, groupJID, caption string) (SendGroupInviteMessageResult, error) {
+func (m *Manager) SendGroupInviteMessage(ctx context.Context, id, mobileNumber, recipientGroupJID, inviteGroupJID, caption string) (SendGroupInviteMessageResult, error) {
 	if !ValidSessionID(id) {
 		return SendGroupInviteMessageResult{}, errors.New("id must be a UUID")
 	}
 	id = strings.ToLower(id)
-	if len(phoneNumber) < 10 || len(phoneNumber) > 15 || !allPhoneNumberDigits(phoneNumber) {
-		return SendGroupInviteMessageResult{}, errors.New("mobileNumber must contain 10 to 15 digits")
+	if _, _, err := ValidateRecipient(mobileNumber, recipientGroupJID); err != nil {
+		return SendGroupInviteMessageResult{}, err
 	}
 	if len([]rune(caption)) > 1024 {
 		return SendGroupInviteMessageResult{}, fmt.Errorf("%w: caption must be 1024 characters or fewer", ErrInvalidGroupInvite)
 	}
-	group, err := types.ParseJID(strings.TrimSpace(groupJID))
+	group, err := types.ParseJID(strings.TrimSpace(inviteGroupJID))
 	if err != nil || group.Server != types.GroupServer || group.User == "" {
 		return SendGroupInviteMessageResult{}, fmt.Errorf("%w: groupJID must be a valid WhatsApp group JID", ErrInvalidGroupInvite)
 	}
@@ -56,7 +56,7 @@ func (m *Manager) SendGroupInviteMessage(ctx context.Context, id, phoneNumber, g
 	if code == "" || code == inviteLink {
 		return SendGroupInviteMessageResult{}, fmt.Errorf("WhatsApp returned an invalid group invite link")
 	}
-	recipient, err := resolveWhatsAppRecipient(ctx, client, phoneNumber)
+	recipient, err := resolveMessageRecipient(ctx, client, mobileNumber, recipientGroupJID)
 	if err != nil {
 		return SendGroupInviteMessageResult{}, err
 	}

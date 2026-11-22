@@ -14,9 +14,10 @@ import (
 )
 
 type sendGroupInviteRequest struct {
-	MobileNumber string `json:"mobileNumber"`
-	GroupJID     string `json:"groupJid"`
-	Caption      string `json:"caption"`
+	MobileNumber     string `json:"mobileNumber"`
+	RecipientGroupJID string `json:"recipientGroupJid"`
+	GroupJID          string `json:"groupJid"`
+	Caption           string `json:"caption"`
 }
 
 func SendGroupInvite(manager *whatsapp.Manager) http.HandlerFunc {
@@ -42,16 +43,15 @@ func SendGroupInvite(manager *whatsapp.Manager) http.HandlerFunc {
 			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain a single JSON object"})
 			return
 		}
-		number := strings.TrimSpace(request.MobileNumber)
-		digits := strings.TrimPrefix(number, "+")
-		if len(digits) < 10 || len(digits) > 15 || !allDigits(digits) {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "mobileNumber must contain 10 to 15 digits, optionally prefixed with +"})
+		digits, recipientGroupJID, err := whatsapp.ValidateRecipient(request.MobileNumber, request.RecipientGroupJID)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		result, err := manager.SendGroupInviteMessage(ctx, strings.ToLower(sessionID), digits, request.GroupJID, request.Caption)
+		result, err := manager.SendGroupInviteMessage(ctx, strings.ToLower(sessionID), digits, recipientGroupJID, request.GroupJID, request.Caption)
 		if err != nil {
 			switch {
 			case errors.Is(err, whatsapp.ErrSessionNotFound):
@@ -60,6 +60,8 @@ func SendGroupInvite(manager *whatsapp.Manager) http.HandlerFunc {
 				WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			case errors.Is(err, whatsapp.ErrWhatsAppNumberNotRegistered):
 				WriteJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			case errors.Is(err, whatsapp.ErrInvalidRecipient):
+				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			case errors.Is(err, whatsapp.ErrInvalidGroupInvite):
 				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			default:

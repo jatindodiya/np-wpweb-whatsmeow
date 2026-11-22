@@ -112,7 +112,7 @@ func (m *Manager) getConnectedSession(id string) (*Service, *whatsmeow.Client, e
 }
 
 func storeOutgoingMessage(id string, service *Service, client *whatsmeow.Client, recipient types.JID, messageID string, timestamp time.Time, messageType string, message *waE2E.Message) bool {
-	if client.Store == nil || client.Store.ID == nil {
+	if recipient.Server == types.GroupServer || client.Store == nil || client.Store.ID == nil {
 		return false
 	}
 	info := types.MessageInfo{

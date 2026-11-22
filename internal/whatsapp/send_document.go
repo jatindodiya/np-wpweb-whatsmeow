@@ -12,7 +12,6 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,13 +26,13 @@ type SendDocumentMessageResult struct {
 	HistoryStored bool   `json:"historyStored"`
 }
 
-func (m *Manager) SendDocumentMessage(ctx context.Context, id, phoneNumber, caption, fileName string, data []byte) (SendDocumentMessageResult, error) {
+func (m *Manager) SendDocumentMessage(ctx context.Context, id, mobileNumber, groupJID, caption, fileName string, data []byte) (SendDocumentMessageResult, error) {
 	if !ValidSessionID(id) {
 		return SendDocumentMessageResult{}, errors.New("id must be a UUID")
 	}
 	id = strings.ToLower(id)
-	if len(phoneNumber) < 10 || len(phoneNumber) > 15 || !allPhoneNumberDigits(phoneNumber) {
-		return SendDocumentMessageResult{}, errors.New("mobileNumber must contain 10 to 15 digits")
+	if _, _, err := ValidateRecipient(mobileNumber, groupJID); err != nil {
+		return SendDocumentMessageResult{}, err
 	}
 	if len(data) == 0 || len(data) > maxDocumentSize {
 		return SendDocumentMessageResult{}, fmt.Errorf("%w: document must be between 1 byte and 64 MiB", ErrInvalidDocument)
@@ -49,18 +48,12 @@ func (m *Manager) SendDocumentMessage(ctx context.Context, id, phoneNumber, capt
 		return SendDocumentMessageResult{}, errors.New("caption must be 1024 characters or fewer")
 	}
 
-	m.mu.RLock()
-	service, exists := m.sessions[id]
-	m.mu.RUnlock()
-	if !exists || service.rejected.Load() {
-		return SendDocumentMessageResult{}, ErrSessionNotFound
-	}
-	client := service.Client
-	if !client.IsConnected() || !client.IsLoggedIn() {
-		return SendDocumentMessageResult{}, ErrSessionNotConnected
+	service, client, err := m.getConnectedSession(id)
+	if err != nil {
+		return SendDocumentMessageResult{}, err
 	}
 
-	recipient, err := resolveWhatsAppRecipient(ctx, client, phoneNumber)
+	recipient, err := resolveMessageRecipient(ctx, client, mobileNumber, groupJID)
 	if err != nil {
 		return SendDocumentMessageResult{}, err
 	}
@@ -92,24 +85,7 @@ func (m *Manager) SendDocumentMessage(ctx context.Context, id, phoneNumber, capt
 		return SendDocumentMessageResult{}, fmt.Errorf("send WhatsApp document message: %w", err)
 	}
 
-	historyStored := false
-	if client.Store != nil && client.Store.ID != nil {
-		info := types.MessageInfo{
-			MessageSource: types.MessageSource{
-				Chat:     recipient,
-				Sender:   client.Store.ID.ToNonAD(),
-				IsFromMe: true,
-			},
-			ID:        response.ID,
-			Type:      "document",
-			Timestamp: response.Timestamp,
-		}
-		if storeErr := service.storeChatMessage(info, message); storeErr != nil {
-			fmt.Printf("WhatsApp session %s sent document %s but failed to store chat history: %v\n", id, response.ID, storeErr)
-		} else {
-			historyStored = true
-		}
-	}
+	historyStored := storeOutgoingMessage(id, service, client, recipient, response.ID, response.Timestamp, "document", message)
 	return SendDocumentMessageResult{
 		ID:            response.ID,
 		Recipient:     recipient.String(),

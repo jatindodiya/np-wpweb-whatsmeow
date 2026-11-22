@@ -38,6 +38,8 @@ func writeMediaError(w http.ResponseWriter, mediaType string, err error) {
 		WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 	case errors.Is(err, whatsapp.ErrWhatsAppNumberNotRegistered):
 		WriteJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	case errors.Is(err, whatsapp.ErrInvalidRecipient):
+		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, whatsapp.ErrInvalidVideo), errors.Is(err, whatsapp.ErrInvalidDocument):
 		WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, whatsapp.ErrMediaTranscoderUnavailable):

@@ -15,6 +15,7 @@ import (
 
 type sendMessageRequest struct {
 	MobileNumber string `json:"mobileNumber"`
+	GroupJID     string `json:"groupJid"`
 	Message      string `json:"message"`
 }
 
@@ -52,12 +53,9 @@ func SendMessage(manager *whatsapp.Manager) http.HandlerFunc {
 			return
 		}
 
-		number := strings.TrimSpace(request.MobileNumber)
-		digits := strings.TrimPrefix(number, "+")
-		if len(digits) < 10 || len(digits) > 15 || !allDigits(digits) {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "mobileNumber must contain 10 to 15 digits, optionally prefixed with +",
-			})
+		digits, groupJID, err := whatsapp.ValidateRecipient(request.MobileNumber, request.GroupJID)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		if strings.TrimSpace(request.Message) == "" {
@@ -69,7 +67,7 @@ func SendMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		result, err := manager.SendTextMessage(ctx, strings.ToLower(sessionID), digits, request.Message)
+		result, err := manager.SendTextMessage(ctx, strings.ToLower(sessionID), digits, groupJID, request.Message)
 		if err != nil {
 			switch {
 			case errors.Is(err, whatsapp.ErrSessionNotFound):
@@ -78,6 +76,8 @@ func SendMessage(manager *whatsapp.Manager) http.HandlerFunc {
 				WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			case errors.Is(err, whatsapp.ErrWhatsAppNumberNotRegistered):
 				WriteJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			case errors.Is(err, whatsapp.ErrInvalidRecipient):
+				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			default:
 				WriteJSON(w, http.StatusBadGateway, map[string]string{
 					"error": fmt.Sprintf("failed to send WhatsApp message: %v", err),

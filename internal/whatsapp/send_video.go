@@ -18,7 +18,6 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -52,13 +51,13 @@ type videoMetadata struct {
 	} `json:"format"`
 }
 
-func (m *Manager) SendVideoMessage(ctx context.Context, id, phoneNumber, caption string, viewOnce bool, data []byte) (SendVideoMessageResult, error) {
+func (m *Manager) SendVideoMessage(ctx context.Context, id, mobileNumber, groupJID, caption string, viewOnce bool, data []byte) (SendVideoMessageResult, error) {
 	if !ValidSessionID(id) {
 		return SendVideoMessageResult{}, errors.New("id must be a UUID")
 	}
 	id = strings.ToLower(id)
-	if len(phoneNumber) < 10 || len(phoneNumber) > 15 || !allPhoneNumberDigits(phoneNumber) {
-		return SendVideoMessageResult{}, errors.New("mobileNumber must contain 10 to 15 digits")
+	if _, _, err := ValidateRecipient(mobileNumber, groupJID); err != nil {
+		return SendVideoMessageResult{}, err
 	}
 	if len(data) == 0 || len(data) > maxVideoSize {
 		return SendVideoMessageResult{}, fmt.Errorf("%w: video must be between 1 byte and 64 MiB", ErrInvalidVideo)
@@ -67,15 +66,9 @@ func (m *Manager) SendVideoMessage(ctx context.Context, id, phoneNumber, caption
 		return SendVideoMessageResult{}, errors.New("caption must be 1024 characters or fewer")
 	}
 
-	m.mu.RLock()
-	service, exists := m.sessions[id]
-	m.mu.RUnlock()
-	if !exists || service.rejected.Load() {
-		return SendVideoMessageResult{}, ErrSessionNotFound
-	}
-	client := service.Client
-	if !client.IsConnected() || !client.IsLoggedIn() {
-		return SendVideoMessageResult{}, ErrSessionNotConnected
+	service, client, err := m.getConnectedSession(id)
+	if err != nil {
+		return SendVideoMessageResult{}, err
 	}
 
 	isGIF, err := isGIFFile(data)
@@ -116,7 +109,7 @@ func (m *Manager) SendVideoMessage(ctx context.Context, id, phoneNumber, caption
 	if err != nil {
 		return SendVideoMessageResult{}, err
 	}
-	recipient, err := resolveWhatsAppRecipient(ctx, client, phoneNumber)
+	recipient, err := resolveMessageRecipient(ctx, client, mobileNumber, groupJID)
 	if err != nil {
 		return SendVideoMessageResult{}, err
 	}
@@ -158,24 +151,7 @@ func (m *Manager) SendVideoMessage(ctx context.Context, id, phoneNumber, caption
 		return SendVideoMessageResult{}, fmt.Errorf("send WhatsApp video message: %w", err)
 	}
 
-	historyStored := false
-	if client.Store != nil && client.Store.ID != nil {
-		info := types.MessageInfo{
-			MessageSource: types.MessageSource{
-				Chat:     recipient,
-				Sender:   client.Store.ID.ToNonAD(),
-				IsFromMe: true,
-			},
-			ID:        response.ID,
-			Type:      "video",
-			Timestamp: response.Timestamp,
-		}
-		if storeErr := service.storeChatMessage(info, message); storeErr != nil {
-			fmt.Printf("WhatsApp session %s sent video %s but failed to store chat history: %v\n", id, response.ID, storeErr)
-		} else {
-			historyStored = true
-		}
-	}
+	historyStored := storeOutgoingMessage(id, service, client, recipient, response.ID, response.Timestamp, "video", message)
 	return SendVideoMessageResult{
 		ID:            response.ID,
 		Recipient:     recipient.String(),

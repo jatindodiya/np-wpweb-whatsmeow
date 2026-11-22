@@ -37,20 +37,24 @@ func SendDocumentMessage(manager *whatsapp.Manager) http.HandlerFunc {
 		}
 		if r.MultipartForm != nil {
 			defer r.MultipartForm.RemoveAll()
-			if err := validateMediaFormKeys(r.MultipartForm, "document", "mobileNumber", "caption"); err != nil {
+			if err := validateMediaFormKeys(r.MultipartForm, "document", "mobileNumber", "groupJid", "caption"); err != nil {
 				WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
 		}
-		number, err := singleFormValue(r, "mobileNumber", true)
+		number, err := singleFormValue(r, "mobileNumber", false)
 		if err != nil {
 			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		number = strings.TrimSpace(number)
-		digits := strings.TrimPrefix(number, "+")
-		if len(digits) < 10 || len(digits) > 15 || !allDigits(digits) {
-			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "mobileNumber must contain 10 to 15 digits, optionally prefixed with +"})
+		groupJID, err := singleFormValue(r, "groupJid", false)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		digits, groupJID, err := whatsapp.ValidateRecipient(number, groupJID)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		caption, err := singleFormValue(r, "caption", false)
@@ -76,7 +80,7 @@ func SendDocumentMessage(manager *whatsapp.Manager) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		result, err := manager.SendDocumentMessage(ctx, strings.ToLower(sessionID), digits, caption, header.Filename, data)
+		result, err := manager.SendDocumentMessage(ctx, strings.ToLower(sessionID), digits, groupJID, caption, header.Filename, data)
 		if err != nil {
 			writeMediaError(w, "document", err)
 			return

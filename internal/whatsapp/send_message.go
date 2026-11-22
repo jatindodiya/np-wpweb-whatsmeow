@@ -26,30 +26,24 @@ type SendMessageResult struct {
 	LinkPreviewError     string `json:"linkPreviewError,omitempty"`
 }
 
-func (m *Manager) SendTextMessage(ctx context.Context, id, phoneNumber, text string) (SendMessageResult, error) {
+func (m *Manager) SendTextMessage(ctx context.Context, id, mobileNumber, groupJID, text string) (SendMessageResult, error) {
 	if !ValidSessionID(id) {
 		return SendMessageResult{}, errors.New("id must be a UUID")
 	}
 	id = strings.ToLower(id)
-	if len(phoneNumber) < 10 || len(phoneNumber) > 15 || !allPhoneNumberDigits(phoneNumber) {
-		return SendMessageResult{}, errors.New("mobileNumber must contain 10 to 15 digits")
+	if _, _, err := ValidateRecipient(mobileNumber, groupJID); err != nil {
+		return SendMessageResult{}, err
 	}
 	if strings.TrimSpace(text) == "" {
 		return SendMessageResult{}, errors.New("message text must not be empty")
 	}
 
-	m.mu.RLock()
-	service, exists := m.sessions[id]
-	m.mu.RUnlock()
-	if !exists || service.rejected.Load() {
-		return SendMessageResult{}, ErrSessionNotFound
-	}
-	client := service.Client
-	if !client.IsConnected() || !client.IsLoggedIn() {
-		return SendMessageResult{}, ErrSessionNotConnected
+	service, client, err := m.getConnectedSession(id)
+	if err != nil {
+		return SendMessageResult{}, err
 	}
 
-	recipient, err := resolveWhatsAppRecipient(ctx, client, phoneNumber)
+	recipient, err := resolveMessageRecipient(ctx, client, mobileNumber, groupJID)
 	if err != nil {
 		return SendMessageResult{}, err
 	}
@@ -93,24 +87,7 @@ func (m *Manager) SendTextMessage(ctx context.Context, id, phoneNumber, text str
 		return SendMessageResult{}, fmt.Errorf("send WhatsApp text message: %w", err)
 	}
 
-	historyStored := false
-	if client.Store != nil && client.Store.ID != nil {
-		info := types.MessageInfo{
-			MessageSource: types.MessageSource{
-				Chat:     recipient,
-				Sender:   client.Store.ID.ToNonAD(),
-				IsFromMe: true,
-			},
-			ID:        response.ID,
-			Type:      "text",
-			Timestamp: response.Timestamp,
-		}
-		if storeErr := service.storeChatMessage(info, message); storeErr != nil {
-			fmt.Printf("WhatsApp session %s sent message %s but failed to store chat history: %v\n", id, response.ID, storeErr)
-		} else {
-			historyStored = true
-		}
-	}
+	historyStored := storeOutgoingMessage(id, service, client, recipient, response.ID, response.Timestamp, "text", message)
 
 	return SendMessageResult{
 		ID:                   response.ID,
