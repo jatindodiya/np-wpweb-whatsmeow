@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -661,6 +662,35 @@ func (m *Manager) Terminate(ctx context.Context, id string) error {
 	return errors.Join(operationErrors...)
 }
 
+func (m *Manager) CloseSession(id string) (SessionStatus, error) {
+	if !ValidSessionID(id) {
+		return SessionStatus{}, errors.New("id must be a UUID")
+	}
+	id = strings.ToLower(id)
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return SessionStatus{}, ErrManagerClosed
+	}
+	if _, initializing := m.initializing[id]; initializing {
+		m.mu.Unlock()
+		return SessionStatus{}, ErrSessionInitializing
+	}
+	service, exists := m.sessions[id]
+	if exists {
+		if service.rejected.Load() {
+			m.mu.Unlock()
+			return SessionStatus{}, ErrSessionNotFound
+		}
+		delete(m.sessions, id)
+		service.Close()
+	}
+	m.mu.Unlock()
+
+	return m.GetStatus(id)
+}
+
 func (m *Manager) GetClient(id string) (*whatsmeow.Client, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -754,6 +784,65 @@ func (m *Manager) GetStatus(id string) (SessionStatus, error) {
 		SessionExists:      true,
 		SessionLoaded:      true,
 	}, nil
+}
+
+func (m *Manager) ListStatuses() ([]SessionStatus, error) {
+	sessionIDs := make(map[string]struct{})
+
+	m.mu.RLock()
+	for id := range m.sessions {
+		sessionIDs[id] = struct{}{}
+	}
+	for id := range m.initializing {
+		sessionIDs[id] = struct{}{}
+	}
+	m.mu.RUnlock()
+
+	dbPath := sqlitePath(m.baseDSN)
+	directory := filepath.Dir(dbPath)
+	if directory == "" {
+		directory = "."
+	}
+	baseName := filepath.Base(dbPath)
+	extension := filepath.Ext(baseName)
+	prefix := strings.TrimSuffix(baseName, extension) + "-"
+
+	entries, err := os.ReadDir(directory)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to list persisted WhatsApp sessions: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, extension) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(name, prefix), extension)
+		if ValidSessionID(id) {
+			sessionIDs[strings.ToLower(id)] = struct{}{}
+		}
+	}
+
+	ids := make([]string, 0, len(sessionIDs))
+	for id := range sessionIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	statuses := make([]SessionStatus, 0, len(ids))
+	for _, id := range ids {
+		status, err := m.GetStatus(id)
+		if errors.Is(err, ErrSessionNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get status for WhatsApp session %s: %w", id, err)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
 }
 
 func (m *Manager) Close() {
