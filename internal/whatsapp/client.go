@@ -30,6 +30,7 @@ const (
 var (
 	ErrSessionAlreadyExists  = errors.New("session is already initialized or initializing")
 	ErrManagerClosed         = errors.New("WhatsApp session manager is closed")
+	ErrSessionInitializing   = errors.New("WhatsApp session is still initializing")
 	ErrSessionNumberMismatch = errors.New("WhatsApp account number does not match phoneNumber")
 	ErrSessionNotFound       = errors.New("WhatsApp session not found")
 	ErrQRCodeUnavailable     = errors.New("QR code is not available")
@@ -43,9 +44,19 @@ type SessionInitResult struct {
 	Existing    bool
 }
 
+type SessionStatus struct {
+	ID                 string `json:"id"`
+	Status             string `json:"status"`
+	Connected          bool   `json:"connected"`
+	WebsocketConnected bool   `json:"websocketConnected"`
+	Authenticated      bool   `json:"authenticated"`
+}
+
 type Service struct {
 	Client       *whatsmeow.Client
 	container    *sqlstore.Container
+	ctx          context.Context
+	cancel       context.CancelFunc
 	mu           sync.RWMutex
 	closeOnce    sync.Once
 	mismatchOnce sync.Once
@@ -188,9 +199,12 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	handleEvent := eventHandler(client)
+	sessionCtx, sessionCancel := context.WithCancel(m.ctx)
 	service := &Service{
 		Client:       client,
 		container:    container,
+		ctx:          sessionCtx,
+		cancel:       sessionCancel,
 		databasePath: sqlitePath(sessionDSN),
 		manager:      m,
 		id:           id,
@@ -206,13 +220,14 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 	keepSession := false
 	defer func() {
 		if !keepSession {
+			sessionCancel()
 			service.Close()
 		}
 	}()
 
 	var qrChannel <-chan whatsmeow.QRChannelItem
 	if deviceStore.ID == nil {
-		qrChannel, err = client.GetQRChannel(m.ctx)
+		qrChannel, err = client.GetQRChannel(sessionCtx)
 		if err != nil {
 			return SessionInitResult{}, fmt.Errorf("failed to prepare pairing: %w", err)
 		}
@@ -340,6 +355,9 @@ func (m *Manager) drainQRChannel(qrChannel <-chan whatsmeow.QRChannelItem, servi
 		}
 		service.mu.Unlock()
 	}
+	if service.ctx.Err() != nil {
+		return
+	}
 	if !timedOut {
 		return
 	}
@@ -362,11 +380,11 @@ func (m *Manager) drainQRChannel(qrChannel <-chan whatsmeow.QRChannelItem, servi
 }
 
 func (m *Manager) startNextPairingAttempt(service *Service) error {
-	if m.ctx.Err() != nil {
-		return m.ctx.Err()
+	if service.ctx.Err() != nil {
+		return service.ctx.Err()
 	}
 	service.Client.Disconnect()
-	qrChannel, err := service.Client.GetQRChannel(m.ctx)
+	qrChannel, err := service.Client.GetQRChannel(service.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to prepare QR pairing: %w", err)
 	}
@@ -374,7 +392,7 @@ func (m *Manager) startNextPairingAttempt(service *Service) error {
 		return fmt.Errorf("failed to reconnect WhatsApp client: %w", err)
 	}
 
-	qrCtx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	qrCtx, cancel := context.WithTimeout(service.ctx, 30*time.Second)
 	defer cancel()
 	qrCode, err := waitForQR(qrCtx, qrChannel)
 	if err != nil {
@@ -387,7 +405,7 @@ func (m *Manager) startNextPairingAttempt(service *Service) error {
 	service.setSessionResult(result)
 	go m.drainQRChannel(qrChannel, service)
 	if service.mode == "code" {
-		pairingCode, pairErr := service.Client.PairPhone(m.ctx, service.phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		pairingCode, pairErr := service.Client.PairPhone(service.ctx, service.phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if pairErr != nil {
 			return fmt.Errorf("failed to request refreshed pairing code: %w", pairErr)
 		}
@@ -475,6 +493,47 @@ func (m *Manager) removeSession(id string, expected *Service) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) Terminate(ctx context.Context, id string) error {
+	if !ValidSessionID(id) {
+		return errors.New("id must be a UUID")
+	}
+	id = strings.ToLower(id)
+
+	m.mu.Lock()
+	if _, initializing := m.initializing[id]; initializing {
+		m.mu.Unlock()
+		return ErrSessionInitializing
+	}
+	service, exists := m.sessions[id]
+	if !exists {
+		m.mu.Unlock()
+		return ErrSessionNotFound
+	}
+	delete(m.sessions, id)
+	service.rejected.Store(true)
+	service.cancel()
+	m.mu.Unlock()
+
+	var operationErrors []error
+	if service.Client.Store != nil && service.Client.Store.ID != nil {
+		if err := service.Client.Logout(ctx); err != nil {
+			operationErrors = append(operationErrors, fmt.Errorf("WhatsApp remote logout failed: %w", err))
+			service.Client.Disconnect()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if deleteErr := service.Client.Store.Delete(cleanupCtx); deleteErr != nil {
+				operationErrors = append(operationErrors, fmt.Errorf("failed to clear local device data: %w", deleteErr))
+			}
+			cancel()
+		}
+	}
+
+	service.Close()
+	if err := removeSessionDatabase(service.databasePath); err != nil {
+		operationErrors = append(operationErrors, fmt.Errorf("failed to delete local session database: %w", err))
+	}
+	return errors.Join(operationErrors...)
+}
+
 func (m *Manager) GetClient(id string) (*whatsmeow.Client, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -499,6 +558,55 @@ func (m *Manager) GetQRCode(id string) (string, error) {
 		return "", ErrQRCodeUnavailable
 	}
 	return service.result.QRCode, nil
+}
+
+func (m *Manager) GetStatus(id string) (SessionStatus, error) {
+	if !ValidSessionID(id) {
+		return SessionStatus{}, errors.New("id must be a UUID")
+	}
+	id = strings.ToLower(id)
+
+	m.mu.RLock()
+	service, exists := m.sessions[id]
+	_, initializing := m.initializing[id]
+	m.mu.RUnlock()
+	if !exists {
+		if initializing {
+			return SessionStatus{
+				ID:     id,
+				Status: "initializing",
+			}, nil
+		}
+		return SessionStatus{}, ErrSessionNotFound
+	}
+	if service.rejected.Load() {
+		return SessionStatus{}, ErrSessionNotFound
+	}
+
+	websocketConnected := service.Client.IsConnected()
+	authenticated := service.Client.IsLoggedIn()
+	connected := websocketConnected && authenticated
+	result := service.sessionResult()
+
+	status := result.Status
+	switch {
+	case connected:
+		status = "connected"
+	case websocketConnected && !authenticated:
+		if status == "" || status == "connected" || status == "disconnected" {
+			status = "awaiting_pairing"
+		}
+	case !websocketConnected && (status == "" || status == "connected"):
+		status = "disconnected"
+	}
+
+	return SessionStatus{
+		ID:                 id,
+		Status:             status,
+		Connected:          connected,
+		WebsocketConnected: websocketConnected,
+		Authenticated:      authenticated,
+	}, nil
 }
 
 func (m *Manager) Close() {
@@ -526,6 +634,9 @@ func (s *Service) Close() {
 		return
 	}
 	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		if s.Client != nil {
 			s.Client.Disconnect()
 		}
