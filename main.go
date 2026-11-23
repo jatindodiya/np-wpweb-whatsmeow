@@ -22,7 +22,7 @@ func main() {
 		return
 	}
 
-	waManager := whatsapp.NewManager(cfg.DBDSN)
+	waManager := whatsapp.NewManager(cfg.DBDSN, cfg.WebhookURL)
 
 	srv := &http.Server{
 		Addr:    cfg.ServerAddr,

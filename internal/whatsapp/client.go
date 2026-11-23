@@ -83,6 +83,7 @@ type Service struct {
 
 type Manager struct {
 	baseDSN      string
+	webhookURL   string
 	ctx          context.Context
 	cancel       context.CancelFunc
 	mu           sync.RWMutex
@@ -91,7 +92,7 @@ type Manager struct {
 	closed       bool
 }
 
-func NewManager(baseDSN string) *Manager {
+func NewManager(baseDSN, webhookURL string) *Manager {
 	waStore.SetOSInfo(linkedDeviceName, waStore.GetWAVersion())
 	waStore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 	waStore.DeviceProps.HistorySyncConfig.OnDemandReady = new(true)
@@ -100,6 +101,7 @@ func NewManager(baseDSN string) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		baseDSN:      baseDSN,
+		webhookURL:   webhookURL,
 		ctx:          ctx,
 		cancel:       cancel,
 		sessions:     make(map[string]*Service),
@@ -233,6 +235,14 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 	}
 	client.AddEventHandler(func(evt any) {
 		handleEvent(evt)
+		switch evt.(type) {
+		case *events.Connected:
+			m.notifyWebhook(service.id, service.phone, "connected")
+		case *events.Disconnected:
+			m.notifyWebhook(service.id, service.phone, "disconnected")
+		case *events.LoggedOut:
+			m.notifyWebhook(service.id, service.phone, "logged_out")
+		}
 		if pairSuccess, ok := evt.(*events.PairSuccess); ok && phoneNumberFromJID(pairSuccess.ID) != phoneNumber {
 			go service.rejectMismatchedNumber()
 		}
@@ -383,15 +393,18 @@ func (m *Manager) Start(id string) (SessionStatus, error) {
 		switch evt.(type) {
 		case *events.Connected:
 			service.setSessionResult(SessionInitResult{Status: "connected"})
+			m.notifyWebhook(service.id, service.phone, "connected")
 		case *events.Disconnected:
 			service.mu.Lock()
 			if service.result.Status == "connected" || service.result.Status == "connecting" {
 				service.result.Status = "disconnected"
 			}
 			service.mu.Unlock()
+			m.notifyWebhook(service.id, service.phone, "disconnected")
 		case *events.LoggedOut:
 			service.loggedOut.Store(true)
 			service.setSessionResult(SessionInitResult{Status: "disconnected"})
+			m.notifyWebhook(service.id, service.phone, "logged_out")
 		}
 	})
 	service.attachChatHistoryHandler()

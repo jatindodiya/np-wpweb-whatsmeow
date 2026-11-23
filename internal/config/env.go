@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -10,6 +11,7 @@ import (
 type Config struct {
 	DBDSN      string
 	ServerAddr string
+	WebhookURL string
 }
 
 func LoadEnvFile(path string) error {
@@ -57,8 +59,17 @@ func Load(envPath string) (Config, error) {
 		dbDSN = "file:whatsmeow.db?_foreign_keys=on"
 	}
 
+	webhookURL := strings.TrimSpace(os.Getenv("WHATSAPP_WEBHOOK_URL"))
+	if webhookURL != "" {
+		parsed, err := url.ParseRequestURI(webhookURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return Config{}, fmt.Errorf("WHATSAPP_WEBHOOK_URL must be an absolute HTTP(S) URL")
+		}
+	}
+
 	return Config{
 		DBDSN:      dbDSN,
 		ServerAddr: addr,
+		WebhookURL: webhookURL,
 	}, nil
 }
