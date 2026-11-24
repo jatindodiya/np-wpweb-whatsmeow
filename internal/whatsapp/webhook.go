@@ -14,24 +14,32 @@ type SessionWebhookEvent struct {
 	Event       string `json:"event"`
 	SessionID   string `json:"sessionId"`
 	PhoneNumber string `json:"phoneNumber,omitempty"`
+	QRCode      string `json:"qrCode,omitempty"`
+	PairingCode string `json:"pairingCode,omitempty"`
 	Timestamp   string `json:"timestamp"`
 }
 
 func (m *Manager) notifyWebhook(sessionID, phoneNumber, event string) {
-	if m.webhookURL == "" {
-		return
-	}
-	payload := SessionWebhookEvent{
+	m.notifyWebhookEvent(SessionWebhookEvent{
 		Event:       event,
 		SessionID:   sessionID,
 		PhoneNumber: phoneNumber,
-		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (m *Manager) notifyWebhookEvent(payload SessionWebhookEvent) {
+	if m.webhookURL == "" {
+		return
+	}
+	payload.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	if payload.Event == "" {
+		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 		defer cancel()
 		if err := postWebhookEvent(ctx, m.webhookURL, payload); err != nil {
-			fmt.Printf("WhatsApp session %s webhook notification (%s) failed: %v\n", sessionID, event, err)
+			fmt.Printf("WhatsApp session %s webhook notification (%s) failed: %v\n", payload.SessionID, payload.Event, err)
 		}
 	}()
 }

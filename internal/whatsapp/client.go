@@ -280,6 +280,12 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 		result.Status = "awaiting_pairing"
 		if mode == "qr" {
 			result.QRCode = qrCode
+			m.notifyWebhookEvent(SessionWebhookEvent{
+				Event:       "qr_code",
+				SessionID:   service.id,
+				PhoneNumber: service.phone,
+				QRCode:      qrCode,
+			})
 		}
 		service.setSessionResult(result)
 		go m.drainQRChannel(qrChannel, service)
@@ -289,6 +295,12 @@ func (m *Manager) Initialize(ctx context.Context, id, phoneNumber, mode string) 
 				return SessionInitResult{}, fmt.Errorf("failed to request pairing code: %w", pairErr)
 			}
 			service.setPairingCode(pairingCode)
+			m.notifyWebhookEvent(SessionWebhookEvent{
+				Event:       "pairing_code",
+				SessionID:   service.id,
+				PhoneNumber: service.phone,
+				PairingCode: pairingCode,
+			})
 		}
 	} else {
 		service.setSessionResult(result)
@@ -518,6 +530,14 @@ func (m *Manager) drainQRChannel(qrChannel <-chan whatsmeow.QRChannelItem, servi
 			service.result.QRCode = ""
 		}
 		service.mu.Unlock()
+		if item.Event == whatsmeow.QRChannelEventCode && service.mode == "qr" {
+			m.notifyWebhookEvent(SessionWebhookEvent{
+				Event:       "qr_code",
+				SessionID:   service.id,
+				PhoneNumber: service.phone,
+				QRCode:      item.Code,
+			})
+		}
 	}
 	if service.ctx.Err() != nil {
 		return
@@ -574,6 +594,12 @@ func (m *Manager) startNextPairingAttempt(service *Service) error {
 			return fmt.Errorf("failed to request refreshed pairing code: %w", pairErr)
 		}
 		service.setPairingCode(pairingCode)
+		m.notifyWebhookEvent(SessionWebhookEvent{
+			Event:       "pairing_code",
+			SessionID:   service.id,
+			PhoneNumber: service.phone,
+			PairingCode: pairingCode,
+		})
 	}
 	return nil
 }
