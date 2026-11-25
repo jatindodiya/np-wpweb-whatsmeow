@@ -12,7 +12,7 @@ import (
 
 type SessionWebhookEvent struct {
 	Event       string `json:"event"`
-	SessionID   string `json:"sessionId"`
+	SessionID   string `json:"accountId"`
 	PhoneNumber string `json:"phoneNumber,omitempty"`
 	QRCode      string `json:"qrCode,omitempty"`
 	PairingCode string `json:"pairingCode,omitempty"`
@@ -65,6 +65,19 @@ func postWebhookEvent(ctx context.Context, endpoint string, event SessionWebhook
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("webhook returned HTTP %d", response.StatusCode)
+	}
+	logEvent := event
+	if logEvent.QRCode != "" {
+		logEvent.QRCode = "[REDACTED]"
+	}
+	if logEvent.PairingCode != "" {
+		logEvent.PairingCode = "[REDACTED]"
+	}
+	logBody, err := json.Marshal(logEvent)
+	if err != nil {
+		fmt.Printf("WhatsApp session %s webhook event sent, but payload logging failed: %v\n", event.SessionID, err)
+	} else {
+		fmt.Printf("WhatsApp webhook event sent: %s %s\n", event.SessionID, string(logBody))
 	}
 	return nil
 }

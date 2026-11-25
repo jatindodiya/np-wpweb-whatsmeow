@@ -12,6 +12,7 @@ type Config struct {
 	DBDSN      string
 	ServerAddr string
 	WebhookURL string
+	APIKey     string
 }
 
 func LoadEnvFile(path string) error {
@@ -67,9 +68,15 @@ func Load(envPath string) (Config, error) {
 		}
 	}
 
+	apiKey := strings.TrimSpace(os.Getenv("API_KEY"))
+	if apiKey == "" {
+		return Config{}, fmt.Errorf("API_KEY must be set")
+	}
+
 	return Config{
 		DBDSN:      dbDSN,
 		ServerAddr: addr,
 		WebhookURL: webhookURL,
+		APIKey:     apiKey,
 	}, nil
 }

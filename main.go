@@ -26,7 +26,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: routes.NewRouter(waManager),
+		Handler: routes.NewRouter(waManager, cfg.APIKey),
 	}
 
 	go func() {

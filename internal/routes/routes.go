@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"time"
@@ -8,6 +10,21 @@ import (
 	"np-npweb-whatsmeow/internal/handlers"
 	"np-npweb-whatsmeow/internal/whatsapp"
 )
+
+func APIKeyMiddleware(apiKey string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providedKey := r.Header.Get("X-API-Key")
+		providedHash := sha256.Sum256([]byte(providedKey))
+		expectedHash := sha256.Sum256([]byte(apiKey))
+		if apiKey == "" || subtle.ConstantTimeCompare(providedHash[:], expectedHash[:]) != 1 {
+			handlers.WriteJSON(w, http.StatusUnauthorized, map[string]string{
+				"error": "missing or invalid API key",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func RequestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +36,7 @@ func RequestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func NewRouter(waManager *whatsapp.Manager) http.Handler {
+func NewRouter(waManager *whatsapp.Manager, apiKey string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handlers.GetHealth)
 	mux.HandleFunc("/initWpSession", handlers.InitWpSession(waManager))
@@ -48,6 +65,6 @@ func NewRouter(waManager *whatsapp.Manager) http.Handler {
 	mux.HandleFunc("/sendDocumentMessage", handlers.SendDocumentMessage(waManager))
 	mux.HandleFunc("/sendPoll", handlers.SendPoll(waManager))
 	mux.HandleFunc("/sendGroupInvite", handlers.SendGroupInvite(waManager))
-	
-	return RequestLoggingMiddleware(mux)
+
+	return RequestLoggingMiddleware(APIKeyMiddleware(apiKey, mux))
 }
