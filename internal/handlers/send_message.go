@@ -65,7 +65,7 @@ func SendMessage(manager *whatsapp.Manager) http.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 200*time.Second)
 		defer cancel()
 		result, err := manager.SendTextMessage(ctx, strings.ToLower(sessionID), digits, groupJID, request.Message)
 		if err != nil {
